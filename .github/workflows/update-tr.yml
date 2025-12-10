@@ -28,7 +28,7 @@ jobs:
         with:
           artifacts: "${{ matrix.site }}.guide.xml,${{ matrix.site }}.guide.xml.gz"
           allowUpdates: true
-          replacesArtifacts: false
+          replacesArtifacts: true
           removeArtifacts: false
           makeLatest: true
           tag: 1.0.0
