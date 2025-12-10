@@ -22,31 +22,13 @@ jobs:
       - name: Grab ${{ matrix.site }}
         run: npm run grab --- --site=${{ matrix.site }} --output=${{ matrix.site }}.guide.xml --maxConnections=4 --gzip
 
-      - name: Upload artifact ${{ matrix.site }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: guides-${{ matrix.site }}
-          path: |
-            ${{ matrix.site }}.guide.xml
-            ${{ matrix.site }}.guide.xml.gz
-
-  release:
-    runs-on: ubuntu-latest
-    needs: grab-tr
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./dist
-
-      - name: Publish combined release
+      - name: Publish ${{ matrix.site }} guide
+        if: hashFiles('${{ matrix.site }}.guide.xml*') != ''
         uses: ncipollo/release-action@v1
         with:
-          artifacts: "dist/**/*.guide.xml,dist/**/*.guide.xml.gz"
+          artifacts: "${{ matrix.site }}.guide.xml,${{ matrix.site }}.guide.xml.gz"
           allowUpdates: true
-          replacesArtifacts: true
-          removeArtifacts: true
+          replacesArtifacts: false
+          removeArtifacts: false
           makeLatest: true
           tag: 1.0.0
