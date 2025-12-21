@@ -1,0 +1,34 @@
+name: update-tr
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 22 * * *'
+
+jobs:
+  grab-tr:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        site: [digiturk.com.tr, tvplus.com.tr, dsmart.com.tr, turksatkablo.com.tr]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+      - run: npm install
+
+      - name: Grab ${{ matrix.site }}
+        run: npm run grab --- --site=${{ matrix.site }} --output=${{ matrix.site }}.guide.xml --maxConnections=4 --gzip
+
+      - name: Publish ${{ matrix.site }} guide
+        if: hashFiles('${{ matrix.site }}.guide.xml*') != ''
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "${{ matrix.site }}.guide.xml,${{ matrix.site }}.guide.xml.gz"
+          allowUpdates: true
+          replacesArtifacts: true
+          removeArtifacts: false
+          makeLatest: true
+          tag: 1.0.0
