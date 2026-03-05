@@ -23,7 +23,7 @@ jobs:
         run: npm run grab --- --site=${{ matrix.site }} --output=${{ matrix.site }}.guide.xml --maxConnections=4 --gzip
 
       - name: Publish ${{ matrix.site }} guide
-        if: hashFiles('${{ matrix.site }}.guide.xml*') != ''
+        if: ${{ hashFiles(format('{0}.guide.xml*', matrix.site)) != '' }}
         uses: ncipollo/release-action@v1
         with:
           artifacts: "${{ matrix.site }}.guide.xml,${{ matrix.site }}.guide.xml.gz"
