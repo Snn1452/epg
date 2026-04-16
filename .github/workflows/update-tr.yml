@@ -2,7 +2,7 @@ name: update-tr
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 22 * * *'
+    - cron: '0 0 * * *'
 
 jobs:
   grab-tr:
@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        site: [digiturk.com.tr, tvplus.com.tr, dsmart.com.tr, turksatkablo.com.tr]
+        sites: [digiturk.com.tr, tvplus.com.tr, dsmart.com.tr, turksatkablo.com.tr]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -19,14 +19,14 @@ jobs:
           cache: 'npm'
       - run: npm install
 
-      - name: Grab ${{ matrix.site }}
-        run: npm run grab --- --site=${{ matrix.site }} --output=${{ matrix.site }}.guide.xml --maxConnections=4 --gzip
+      - name: Grab ${{ matrix.sites }}
+        run: npm run grab --- --sites=${{ matrix.sites }} --output=${{ matrix.sites }}.guide.xml --maxConnections=4 --gzip
 
-      - name: Publish ${{ matrix.site }} guide
-        if: ${{ hashFiles(format('{0}.guide.xml*', matrix.site)) != '' }}
+      - name: Publish ${{ matrix.sites }} guide
+        if: ${{ hashFiles(format('{0}.guide.xml*', matrix.sites)) != '' }}
         uses: ncipollo/release-action@v1
         with:
-          artifacts: "${{ matrix.site }}.guide.xml,${{ matrix.site }}.guide.xml.gz"
+          artifacts: "${{ matrix.sites }}.guide.xml,${{ matrix.sites }}.guide.xml.gz"
           allowUpdates: true
           replacesArtifacts: true
           removeArtifacts: false
