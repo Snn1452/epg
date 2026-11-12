@@ -4,6 +4,33 @@ const customParseFormat = require('dayjs/plugin/customParseFormat')
 
 dayjs.extend(customParseFormat)
 
+const authUrl = 'https://izmaottvsc14.tvplus.com.tr:33207/EPG/JSON/Authenticate'
+const authData = {
+  terminaltype: 'webtv',
+  terminalvendor:
+    '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36',
+  osversion: 'Win32',
+  userType: '3',
+  utcEnable: '1',
+  timezone: 'Europe/Istanbul'
+}
+let authenticationPromise
+
+function authenticate() {
+  if (!authenticationPromise) {
+    authenticationPromise = axios.post(authUrl, authData, { timeout: 15000 }).then(response => {
+      const cookies = response.headers['set-cookie']
+      if (!Array.isArray(cookies) || !cookies.length) {
+        throw new Error('TV+ authentication response did not include a session cookie.')
+      }
+
+      return cookies.join(';')
+    })
+  }
+
+  return authenticationPromise
+}
+
 module.exports = {
   site: 'tvplus.com.tr',
   days: 2,
@@ -11,20 +38,8 @@ module.exports = {
   request: {
     method: 'POST',
     async headers() {
-      const response = await axios
-        .post('https://izmaottvsc14.tvplus.com.tr:33207/EPG/JSON/Authenticate', {
-          terminaltype: 'webtv',
-          terminalvendor:
-            '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36',
-          osversion: 'Win32',
-          userType: '3',
-          utcEnable: '1',
-          timezone: 'Europe/Istanbul'
-        })
-        .catch(console.error)
-
       return {
-        cookie: response.headers['set-cookie'].join(';')
+        cookie: process.env.TVPLUS_COOKIE || await authenticate()
       }
     },
     data({ channel, date }) {

@@ -35,12 +35,16 @@ it('can generate valid request method', () => {
   expect(request.method).toBe('POST')
 })
 
-it('can generate valid request headers', async () => {
+it('can generate valid request headers and reuse one authentication session', async () => {
   const headers = await request.headers()
+  const reusedHeaders = await request.headers()
+
   expect(headers).toMatchObject({
     cookie:
       'XSESSIONID=05DIPYMD4BHOKRQCZTHF8F5GHMMBCNJ6; Domain=izmaottvsc14.tvplus.com.tr; Path=/; Secure; HttpOnly;JSESSIONID=05DIPYMD4BHOKRQCZTHF8F5GHMMBCNJ6; Domain=izmaottvsc14.tvplus.com.tr; Path=/; HttpOnly'
   })
+  expect(reusedHeaders).toEqual(headers)
+  expect(axios.post).toHaveBeenCalledTimes(1)
 })
 
 it('can generate valid request data', () => {
