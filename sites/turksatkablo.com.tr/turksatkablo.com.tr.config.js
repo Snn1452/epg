@@ -4,11 +4,13 @@ const timezone = require('dayjs/plugin/timezone')
 dayjs.extend(utc)
 dayjs.extend(timezone)
 
+const tz = 'Europe/Istanbul'
+
 module.exports = {
   site: 'turksatkablo.com.tr',
   days: 2,
   url({ date }) {
-    const dayOfMonth = date.format('DD') // Get the current day of the month (01-31)
+    const dayOfMonth = date.tz(tz).format('DD')
 
     return `https://www.turksatkablo.com.tr/userUpload/EPG/${dayOfMonth}.json?_=${date.valueOf()}`
   },
@@ -44,38 +46,39 @@ module.exports = {
   },
   async channels() {
     const axios = require('axios')
-    const dayjs = require('dayjs')
-    const dayOfMonth = dayjs().format('DD')
+    const dayOfMonth = dayjs().tz(tz).format('DD')
 
-    const data = await axios
-      .get(`https://www.turksatkablo.com.tr/userUpload/EPG/${dayOfMonth}.json`)
-      .then(r => r.data)
-      .catch(console.log)
+    const { data } = await axios.get(`https://www.turksatkablo.com.tr/userUpload/EPG/${dayOfMonth}.json`)
 
-    let channels = []
+    if (!Array.isArray(data?.k)) {
+      throw new Error('Türksat EPG response does not contain a channel list.')
+    }
 
-    data.k.forEach(item => {
-      channels.push({
+    return data.k.map((item, index) => {
+      const siteId = item.i ?? item.x
+      if (siteId == null || typeof item.n !== 'string' || !item.n.trim()) {
+        throw new Error(`Türksat EPG channel at index ${index} has invalid metadata.`)
+      }
+
+      return {
         lang: 'tr',
-        site_id: item.x,
+        site_id: String(siteId),
         name: item.n
-      })
+      }
     })
-
-    return channels
   }
 }
 
 function parseStart(item, date) {
-  const time = `${date.format('YYYY-MM-DD')} ${item.c}`
+  const time = `${date.tz(tz).format('YYYY-MM-DD')} ${item.c}`
 
-  return dayjs.tz(time, 'YYYY-MM-DD HH:mm', 'Europe/Istanbul').utc()
+  return dayjs.tz(time, 'YYYY-MM-DD HH:mm', tz).utc()
 }
 
 function parseStop(item, date) {
-  const time = `${date.format('YYYY-MM-DD')} ${item.d}`
+  const time = `${date.tz(tz).format('YYYY-MM-DD')} ${item.d}`
 
-  return dayjs.tz(time, 'YYYY-MM-DD HH:mm', 'Europe/Istanbul').utc()
+  return dayjs.tz(time, 'YYYY-MM-DD HH:mm', tz).utc()
 }
 
 function parseItems(content, channel) {
@@ -85,8 +88,11 @@ function parseItems(content, channel) {
   } catch {
     return []
   }
-  if (!parsed || !parsed.k) return []
-  const data = parsed.k.find(c => c.x == channel.site_id)
+  if (!parsed || !Array.isArray(parsed.k)) return []
+  const data = parsed.k.find(item => {
+    const siteId = item.i ?? item.x
+    return siteId != null && String(siteId) === String(channel.site_id)
+  })
 
-  return data ? data.p : []
+  return Array.isArray(data?.p) ? data.p : []
 }
