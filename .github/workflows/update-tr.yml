@@ -1,0 +1,777 @@
+name: update-tr
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/update-tr.yml
+      - package.json
+      - package-lock.json
+      - scripts/**
+      - sites/turksatkablo.com.tr/**
+      - sites/tvplus.com.tr/**
+  schedule:
+    - cron: '17 0 * * *'
+
+concurrency:
+  group: update-tr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cancel-superseded:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Require master branch
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+            echo "::error::The Turkish EPG workflow must run from master."
+            exit 1
+          fi
+
+      - name: Cancel superseded EPG runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_ids=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" | jq -r --arg branch "$GITHUB_REF_NAME" '.workflow_runs[] | select(.path == ".github/workflows/update-tr.yml" and .head_branch == $branch) | select(.status == "queued" or .status == "in_progress") | .id')
+
+          while IFS= read -r run_id; do
+            [[ -z "$run_id" || "$run_id" == "$GITHUB_RUN_ID" ]] && continue
+
+            if gh api --silent --method POST "repos/${GITHUB_REPOSITORY}/actions/runs/$run_id/cancel"; then
+              echo "Cancelled superseded EPG workflow run $run_id."
+            else
+              status=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/$run_id" --jq '.status')
+              if [[ "$status" != "completed" ]]; then
+                echo "::error::Could not cancel superseded EPG workflow run $run_id (status: $status)."
+                exit 1
+              fi
+            fi
+          done <<< "$run_ids"
+
+      - name: Keep scheduled workflow enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          workflow_id=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq '.workflow_id')
+          if [[ ! "$workflow_id" =~ ^[0-9]+$ ]]; then
+            echo "::warning::Could not resolve the current workflow ID."
+            exit 0
+          fi
+
+          response=$(gh api --include --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}/enable" 2>&1) || {
+            printf '%s\n' "$response"
+            echo "::warning::Could not refresh the scheduled workflow's enabled state."
+            exit 0
+          }
+
+          printf '%s\n' "$response" | head -n 1
+          echo "Scheduled workflow $workflow_id is enabled."
+
+  sync-upstream:
+    needs: cancel-superseded
+    concurrency:
+      group: epg-master-write
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.sync.outputs.sha }}
+    steps:
+      - name: Sync with upstream
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          response=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/merge-upstream" --field branch=master)
+          merge_type=$(jq -r '.merge_type' <<< "$response")
+          base_branch=$(jq -r '.base_branch' <<< "$response")
+
+          case "$merge_type" in
+            merge|fast-forward|none) ;;
+            *)
+              echo "::error::Unexpected upstream sync result: $merge_type"
+              exit 1
+              ;;
+          esac
+
+          if [[ "$base_branch" != "iptv-org:master" ]]; then
+            echo "::error::Unexpected upstream branch: $base_branch"
+            exit 1
+          fi
+
+          if [[ "$merge_type" == "none" && "$GITHUB_EVENT_NAME" != "push" ]]; then
+            upstream_sha=$(gh api "repos/iptv-org/epg/commits/master" --jq '.sha')
+            checked_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            state=$(jq -n -c \
+              --arg checked_at "$checked_at" \
+              --arg upstream_sha "$upstream_sha" \
+              '{ checked_at: $checked_at, upstream: "iptv-org/epg:master", upstream_sha: $upstream_sha, merge_type: "none" }')
+            encoded_state=$(printf '%s\n' "$state" | base64 -w0)
+            existing_sha=$(gh api "repos/${GITHUB_REPOSITORY}/contents/.github/upstream-sync.json?ref=master" --jq '.sha' 2>/dev/null || true)
+
+            api_args=(
+              --method PUT
+              "repos/${GITHUB_REPOSITORY}/contents/.github/upstream-sync.json"
+              --field "message=chore(ci): record upstream sync check"
+              --field "content=$encoded_state"
+              --field "branch=master"
+            )
+            if [[ -n "$existing_sha" ]]; then
+              api_args+=(--field "sha=$existing_sha")
+            fi
+
+            gh api "${api_args[@]}" >/dev/null
+            echo "Recorded a no-change upstream check for $upstream_sha."
+          fi
+
+          sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/master" --jq '.sha')
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve the synchronized master commit."
+            exit 1
+          fi
+
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Upstream synchronization"
+            echo "- Source: iptv-org/epg:master"
+            echo "- Result: $merge_type"
+            echo "- Commit: $sha"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  grab-tr:
+    needs: sync-upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    env:
+      NODE_USE_SYSTEM_CA: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.sync-upstream.outputs.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: 'npm'
+      - run: npm ci
+
+      - name: Validate Türksat channel catalogue
+        run: |
+          npm run channels:lint -- sites/turksatkablo.com.tr/turksatkablo.com.tr.channels.xml
+          npm run channels:validate -- sites/turksatkablo.com.tr/turksatkablo.com.tr.channels.xml
+
+      - name: Test Türksat timezone handling
+        run: npm run test -- --runTestsByPath sites/turksatkablo.com.tr/turksatkablo.com.tr.test.js
+
+      - name: Test TV+ scraper session reuse
+        run: npm run test -- --runTestsByPath sites/tvplus.com.tr/tvplus.com.tr.test.js
+
+      - name: Authenticate TV+ session
+        run: |
+          node <<'NODE'
+          const crypto = require('node:crypto')
+          const fs = require('node:fs')
+          const { request } = require('./sites/tvplus.com.tr/tvplus.com.tr.config.js')
+
+          ;(async () => {
+            const { cookie } = await request.headers()
+            const delimiter = `TVPLUS_${crypto.randomUUID()}`
+
+            console.log(`::add-mask::${cookie}`)
+            fs.appendFileSync(process.env.GITHUB_ENV, `TVPLUS_COOKIE<<${delimiter}\n${cookie}\n${delimiter}\n`)
+            console.log('TV+ authentication succeeded; the session will be reused for this run.')
+          })().catch(error => {
+            console.error(error)
+            process.exitCode = 1
+          })
+          NODE
+
+      # The upstream server omits its intermediate; trust only this fingerprint-pinned GlobalSign CA.
+      - name: Verify pinned GlobalSign R46 intermediate
+        env:
+          CA_FILE: ${{ github.workspace }}/sites/turksatkablo.com.tr/globalsign-gcc-r46-alphassl-ca-2025.pem
+        run: |
+          set -euo pipefail
+
+          actual=$(openssl x509 -in "$CA_FILE" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          expected=d2ac9dcc7a255029a5f5180d63f1a9ed60e11412a85c148d4b71f6ae1a36695c
+
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::The bundled GlobalSign intermediate certificate fingerprint does not match the official certificate."
+            exit 1
+          fi
+
+          openssl x509 -in "$CA_FILE" -noout -checkend 0
+          openssl x509 -in "$CA_FILE" -noout -subject -issuer -dates
+          echo "NODE_EXTRA_CA_CERTS=$CA_FILE" >> "$GITHUB_ENV"
+
+      - name: Verify Türksat TLS and feed
+        id: verify-turksat-feed
+        run: |
+          node <<'NODE'
+          const https = require('node:https')
+          const fs = require('node:fs')
+          const dayjs = require('dayjs')
+          const utc = require('dayjs/plugin/utc')
+          const { parser } = require('./sites/turksatkablo.com.tr/turksatkablo.com.tr.config.js')
+
+          dayjs.extend(utc)
+
+          const timezone = 'Europe/Istanbul'
+          const dateParts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+            timeZone: timezone,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit'
+          }).formatToParts(new Date()).map(part => [part.type, part.value]))
+          const today = `${dateParts.year}-${dateParts.month}-${dateParts.day}`
+          const days = [today]
+          const channelXml = fs.readFileSync('sites/turksatkablo.com.tr/turksatkablo.com.tr.channels.xml', 'utf8')
+          const staticSiteIds = [...channelXml.matchAll(/<channel[^>]+site_id="([^"]+)"/g)].map(match => match[1])
+          const staticIdSet = new Set(staticSiteIds)
+
+          if (staticSiteIds.length === 0 || staticIdSet.size !== staticSiteIds.length) {
+            throw new Error('The checked-in Türksat channel XML contains no site IDs or duplicate site IDs.')
+          }
+
+          function fetchFeed(day, cacheBust) {
+            const dayOfMonth = day.slice(-2)
+            const timestamp = Date.parse(`${day}T00:00:00.000Z`)
+            const query = cacheBust ? `?_=${timestamp}` : ''
+            const url = `https://www.turksatkablo.com.tr/userUpload/EPG/${dayOfMonth}.json${query}`
+
+            return new Promise((resolve, reject) => {
+              const request = https.get(url, { timeout: 10000 }, response => {
+                const chunks = []
+                response.on('data', chunk => chunks.push(chunk))
+                response.on('end', () => {
+                  if (response.statusCode !== 200) {
+                    reject(new Error(`Türksat ${day} feed (cacheBust=${cacheBust}) returned HTTP ${response.statusCode}.`))
+                    return
+                  }
+
+                  try {
+                    const data = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+                    if (!Array.isArray(data?.k) || data.k.length === 0) {
+                      throw new Error('The EPG response does not contain a non-empty channel list.')
+                    }
+                    resolve(data.k)
+                  } catch (error) {
+                    reject(new Error(`Türksat ${day} feed (cacheBust=${cacheBust}) returned invalid JSON: ${error.message}`))
+                  }
+                })
+              })
+
+              request.on('timeout', () => request.destroy(new Error(`Türksat ${day} feed timed out after 10 seconds.`)))
+              request.on('error', reject)
+            })
+          }
+
+          function inspectFeed(day, channels, cacheBust) {
+            const getSiteId = channel => channel.i ?? channel.x
+            const channelMap = new Map(channels.map(channel => [String(getSiteId(channel)), channel]))
+            const matched = staticSiteIds.map(siteId => channelMap.get(siteId)).filter(Boolean)
+            const unmatchedSiteIds = staticSiteIds.filter(siteId => !channelMap.has(siteId))
+            const withPrograms = matched.filter(channel => Array.isArray(channel.p) && channel.p.length > 0)
+            const rawProgrammeCount = matched.reduce((total, channel) => total + (Array.isArray(channel.p) ? channel.p.length : 0), 0)
+            const feedContent = JSON.stringify({ k: channels })
+            const parsedProgrammeCount = matched.reduce((total, channel) => {
+              const date = dayjs.utc(`${day}T00:00:00.000Z`)
+              return total + parser({
+                content: feedContent,
+                channel: { site_id: String(getSiteId(channel)) },
+                date
+              }).length
+            }, 0)
+
+            console.log(
+              `Türksat feed ${day} (cacheBust=${cacheBust}): ` +
+              `static XML IDs matched ${matched.length}/${staticSiteIds.length}; ` +
+              `${unmatchedSiteIds.length} IDs missing; ` +
+              `${withPrograms.length} matched channels have p entries; ` +
+              `raw=${rawProgrammeCount}; parser=${parsedProgrammeCount}.`
+            )
+
+            return { matchedChannels: matched.length, rawProgrammeCount, parsedProgrammeCount }
+          }
+
+          Promise.allSettled(days.flatMap(day => [
+            fetchFeed(day, false).then(channels => ({ day, cacheBust: false, channels })),
+            fetchFeed(day, true).then(channels => ({ day, cacheBust: true, channels }))
+          ]))
+            .then(outcomes => {
+              const feeds = outcomes.filter(outcome => outcome.status === 'fulfilled').map(outcome => outcome.value)
+              const failures = outcomes.filter(outcome => outcome.status === 'rejected')
+              failures.forEach(outcome => console.warn(`Türksat optional feed request failed: ${outcome.reason.code || outcome.reason.name}: ${outcome.reason.message}`))
+
+              if (!feeds.some(feed => feed.day === today && feed.cacheBust)) {
+                throw new Error(`The exact cache-busted feed for ${today} is unavailable.`)
+              }
+
+              console.log(`Türksat TLS verified; ${staticSiteIds.length} static channels loaded from XML for ${today}.`)
+
+              const todayChannels = (feeds.find(feed => feed.day === today && !feed.cacheBust) || feeds.find(feed => feed.day === today && feed.cacheBust)).channels
+              const providerSiteIds = new Set(todayChannels.map(channel => String(channel.i ?? channel.x)))
+              const matchingStaticIds = staticSiteIds.filter(siteId => providerSiteIds.has(siteId))
+              console.log(`Türksat provider schema verified: ${todayChannels.length} channels; ${matchingStaticIds.length}/${staticSiteIds.length} checked-in IDs match.`)
+
+              const results = feeds.map(feed => ({
+                ...feed,
+                counts: inspectFeed(feed.day, feed.channels, feed.cacheBust)
+              }))
+              const cacheBustedFeeds = results.filter(feed => feed.cacheBust)
+
+              const minimumMatchedChannels = Math.ceil(staticSiteIds.length * 0.8)
+              if (cacheBustedFeeds.some(feed =>
+                feed.counts.matchedChannels < minimumMatchedChannels || feed.counts.parsedProgrammeCount === 0
+              )) {
+                throw new Error(`The exact cache-busted feed must match at least ${minimumMatchedChannels}/${staticSiteIds.length} checked-in channels and contain parseable programmes.`)
+              }
+            })
+            .catch(error => {
+              console.error(`::error::Türksat TLS/feed preflight failed: ${error.code || error.name}: ${error.message}`)
+              process.exitCode = 1
+            })
+          NODE
+
+      - name: Diagnose Türksat TLS certificate chain
+        if: failure() && steps.verify-turksat-feed.outcome == 'failure'
+        continue-on-error: true
+        env:
+          CA_FILE: ${{ github.workspace }}/sites/turksatkablo.com.tr/globalsign-gcc-r46-alphassl-ca-2025.pem
+        run: |
+          certificate_report=$(timeout 15s openssl s_client \
+            -connect www.turksatkablo.com.tr:443 \
+            -servername www.turksatkablo.com.tr \
+            -CAfile "$CA_FILE" -partial_chain -verify_return_error \
+            -showcerts </dev/null 2>&1 || true)
+
+          printf '%s\n' "$certificate_report" | grep -E '^(Certificate chain|[[:space:]]*[0-9]+ s:|[[:space:]]+i:|subject=|issuer=|verify error:|Verify return code:)' || true
+
+      - name: Grab tvplus.com.tr
+        id: grab-tvplus
+        continue-on-error: true
+        env:
+          SITE: tvplus.com.tr
+        run: |
+          python3 - <<'PY'
+          import os
+          import signal
+          import subprocess
+          import sys
+
+          site = os.environ["SITE"]
+          command = [
+              "npm", "run", "grab", "---",
+              f"--sites={site}",
+              f"--output={site}.guide.xml",
+              "--maxConnections=4",
+              "--gzip",
+          ]
+          fatal_tls_errors = (
+              "unable to verify the first certificate",
+              "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+              "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+              "SELF_SIGNED_CERT_IN_CHAIN",
+              "CERT_HAS_EXPIRED",
+              "certificate has expired",
+              "ERR_TLS_CERT_ALTNAME_INVALID",
+              "CERTIFICATE_VERIFY_FAILED",
+          )
+
+          with open("grab.log", "w", encoding="utf-8", errors="replace") as log:
+              process = subprocess.Popen(
+                  command,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+                  encoding="utf-8",
+                  errors="replace",
+                  bufsize=1,
+                  start_new_session=True,
+              )
+
+              try:
+                  for line in process.stdout:
+                      sys.stdout.write(line)
+                      sys.stdout.flush()
+                      log.write(line)
+                      log.flush()
+
+                      if any(error in line for error in fatal_tls_errors):
+                          print(
+                              f"::error::{site} encountered a TLS certificate validation error. "
+                              "The grabber process tree is being stopped immediately; "
+                              "no further channel requests will be attempted.",
+                              file=sys.stderr,
+                              flush=True,
+                          )
+                          try:
+                              os.killpg(process.pid, signal.SIGTERM)
+                          except ProcessLookupError:
+                              pass
+
+                          try:
+                              process.wait(timeout=5)
+                          except subprocess.TimeoutExpired:
+                              try:
+                                  os.killpg(process.pid, signal.SIGKILL)
+                              except ProcessLookupError:
+                                  pass
+                              process.wait()
+
+                          sys.exit(1)
+
+                  sys.exit(process.wait())
+              except BaseException:
+                  if process.poll() is None:
+                      try:
+                          os.killpg(process.pid, signal.SIGTERM)
+                      except ProcessLookupError:
+                          pass
+                      try:
+                          process.wait(timeout=5)
+                      except subprocess.TimeoutExpired:
+                          try:
+                              os.killpg(process.pid, signal.SIGKILL)
+                          except ProcessLookupError:
+                              pass
+                          process.wait()
+                  raise
+          PY
+
+      - name: Validate tvplus.com.tr guide
+        id: validate-tvplus
+        if: ${{ steps.grab-tvplus.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GUIDE_FILE: tvplus.com.tr.guide.xml
+          SITE: tvplus.com.tr
+        run: |
+          set -euo pipefail
+
+          if [[ ! -s "$GUIDE_FILE" || ! -s "$GUIDE_FILE.gz" ]]; then
+            echo "::error::$SITE did not produce both XML and GZIP guide files."
+            exit 1
+          fi
+
+          gzip -t "$GUIDE_FILE.gz"
+
+          total_records=$(grep -Ec '\([0-9]+ programs\)' grab.log || true)
+          program_records=$(grep -Ec '\([1-9][0-9]* programs\)' grab.log || true)
+          programme_count=$(grep -o '<programme ' "$GUIDE_FILE" | wc -l || true)
+          http_403_count=$(grep -Ec 'ERR: Request failed with status code 403' grab.log || true)
+
+          {
+            echo "### Guide validation: $SITE"
+            echo "- XMLTV programme entries: $programme_count"
+            echo "- HTTP 403 responses: $http_403_count"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if (( total_records == 0 )); then
+            echo "::error::Could not determine channel-day coverage for $SITE."
+            exit 1
+          fi
+
+          baseline_records=0
+          baseline_programmes=0
+          case "$SITE" in
+            tvplus.com.tr)
+              baseline_records=45
+              baseline_programmes=1538
+              ;;
+          esac
+
+          coverage_percent=$((program_records * 100 / total_records))
+          {
+            echo "- Channel-day coverage: $program_records/$total_records ($coverage_percent%)"
+            if (( baseline_records > 0 )); then
+              echo "- Historical floor: at least $((baseline_records / 2)) non-empty channel-day records and $((baseline_programmes / 2)) programmes"
+            else
+              echo "- No positive historical baseline is available; non-empty XMLTV data is required"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if (( programme_count == 0 )); then
+            if (( http_403_count > 0 )); then
+              echo "::error::$SITE received HTTP 403 for $http_403_count grabber requests and produced no XMLTV programme entries; refusing to publish an empty guide."
+            else
+              echo "::error::$SITE produced no XMLTV programme entries; refusing to publish an empty guide."
+            fi
+            exit 1
+          fi
+
+          if (( http_403_count > 0 )); then
+            echo "::warning::$SITE received $http_403_count HTTP 403 responses while producing a non-empty guide."
+          fi
+
+          if (( baseline_records > 0 )) && (( program_records * 2 < baseline_records || programme_count * 2 < baseline_programmes )); then
+            echo "::error::$SITE guide is below half of its historical baseline (2026-08-16): $program_records/$baseline_records non-empty channel-day records and $programme_count/$baseline_programmes programmes. Refusing to publish."
+            exit 1
+          fi
+
+      - name: Upload validated tvplus.com.tr guides
+        id: upload-tvplus
+        if: ${{ steps.validate-tvplus.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: guides-tvplus.com.tr
+          path: |
+            tvplus.com.tr.guide.xml
+            tvplus.com.tr.guide.xml.gz
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Grab turksatkablo.com.tr
+        id: grab-turksatkablo
+        continue-on-error: true
+        env:
+          SITE: turksatkablo.com.tr
+        run: |
+          python3 - <<'PY'
+          import os
+          import signal
+          import subprocess
+          import sys
+
+          site = os.environ["SITE"]
+          command = [
+              "npm", "run", "grab", "---",
+              f"--sites={site}",
+              f"--output={site}.guide.xml",
+              "--maxConnections=4",
+              "--gzip",
+          ]
+          fatal_tls_errors = (
+              "unable to verify the first certificate",
+              "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+              "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+              "SELF_SIGNED_CERT_IN_CHAIN",
+              "CERT_HAS_EXPIRED",
+              "certificate has expired",
+              "ERR_TLS_CERT_ALTNAME_INVALID",
+              "CERTIFICATE_VERIFY_FAILED",
+          )
+
+          with open("grab.log", "w", encoding="utf-8", errors="replace") as log:
+              process = subprocess.Popen(
+                  command,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+                  encoding="utf-8",
+                  errors="replace",
+                  bufsize=1,
+                  start_new_session=True,
+              )
+
+              try:
+                  for line in process.stdout:
+                      sys.stdout.write(line)
+                      sys.stdout.flush()
+                      log.write(line)
+                      log.flush()
+
+                      if any(error in line for error in fatal_tls_errors):
+                          print(
+                              f"::error::{site} encountered a TLS certificate validation error. "
+                              "The grabber process tree is being stopped immediately; "
+                              "no further channel requests will be attempted.",
+                              file=sys.stderr,
+                              flush=True,
+                          )
+                          try:
+                              os.killpg(process.pid, signal.SIGTERM)
+                          except ProcessLookupError:
+                              pass
+
+                          try:
+                              process.wait(timeout=5)
+                          except subprocess.TimeoutExpired:
+                              try:
+                                  os.killpg(process.pid, signal.SIGKILL)
+                              except ProcessLookupError:
+                                  pass
+                              process.wait()
+
+                          sys.exit(1)
+
+                  sys.exit(process.wait())
+              except BaseException:
+                  if process.poll() is None:
+                      try:
+                          os.killpg(process.pid, signal.SIGTERM)
+                      except ProcessLookupError:
+                          pass
+                      try:
+                          process.wait(timeout=5)
+                      except subprocess.TimeoutExpired:
+                          try:
+                              os.killpg(process.pid, signal.SIGKILL)
+                          except ProcessLookupError:
+                              pass
+                          process.wait()
+                  raise
+          PY
+
+      - name: Validate turksatkablo.com.tr guide
+        id: validate-turksatkablo
+        if: ${{ steps.grab-turksatkablo.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GUIDE_FILE: turksatkablo.com.tr.guide.xml
+          SITE: turksatkablo.com.tr
+        run: |
+          set -euo pipefail
+
+          if [[ ! -s "$GUIDE_FILE" || ! -s "$GUIDE_FILE.gz" ]]; then
+            echo "::error::$SITE did not produce both XML and GZIP guide files."
+            exit 1
+          fi
+
+          gzip -t "$GUIDE_FILE.gz"
+
+          total_records=$(grep -Ec '\([0-9]+ programs\)' grab.log || true)
+          program_records=$(grep -Ec '\([1-9][0-9]* programs\)' grab.log || true)
+          programme_count=$(grep -o '<programme ' "$GUIDE_FILE" | wc -l || true)
+          http_403_count=$(grep -Ec 'ERR: Request failed with status code 403' grab.log || true)
+
+          {
+            echo "### Guide validation: $SITE"
+            echo "- XMLTV programme entries: $programme_count"
+            echo "- HTTP 403 responses: $http_403_count"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if (( total_records == 0 )); then
+            echo "::error::Could not determine channel-day coverage for $SITE."
+            exit 1
+          fi
+
+          baseline_records=0
+          baseline_programmes=0
+          case "$SITE" in
+            tvplus.com.tr)
+              baseline_records=45
+              baseline_programmes=1538
+              ;;
+          esac
+
+          coverage_percent=$((program_records * 100 / total_records))
+          {
+            echo "- Channel-day coverage: $program_records/$total_records ($coverage_percent%)"
+            if (( baseline_records > 0 )); then
+              echo "- Historical floor: at least $((baseline_records / 2)) non-empty channel-day records and $((baseline_programmes / 2)) programmes"
+            else
+              echo "- No positive historical baseline is available; non-empty XMLTV data is required"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if (( programme_count == 0 )); then
+            if (( http_403_count > 0 )); then
+              echo "::error::$SITE received HTTP 403 for $http_403_count grabber requests and produced no XMLTV programme entries; refusing to publish an empty guide."
+            else
+              echo "::error::$SITE produced no XMLTV programme entries; refusing to publish an empty guide."
+            fi
+            exit 1
+          fi
+
+          if (( http_403_count > 0 )); then
+            echo "::warning::$SITE received $http_403_count HTTP 403 responses while producing a non-empty guide."
+          fi
+
+          if (( baseline_records > 0 )) && (( program_records * 2 < baseline_records || programme_count * 2 < baseline_programmes )); then
+            echo "::error::$SITE guide is below half of its historical baseline (2026-08-16): $program_records/$baseline_records non-empty channel-day records and $programme_count/$baseline_programmes programmes. Refusing to publish."
+            exit 1
+          fi
+
+      - name: Upload validated turksatkablo.com.tr guides
+        id: upload-turksatkablo
+        if: ${{ steps.validate-turksatkablo.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: guides-turksatkablo.com.tr
+          path: |
+            turksatkablo.com.tr.guide.xml
+            turksatkablo.com.tr.guide.xml.gz
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Report incomplete provider runs
+        if: always()
+        env:
+          TVPLUS_GRAB: ${{ steps.grab-tvplus.outcome }}
+          TVPLUS_VALIDATE: ${{ steps.validate-tvplus.outcome }}
+          TVPLUS_UPLOAD: ${{ steps.upload-tvplus.outcome }}
+          TURKSAT_GRAB: ${{ steps.grab-turksatkablo.outcome }}
+          TURKSAT_VALIDATE: ${{ steps.validate-turksatkablo.outcome }}
+          TURKSAT_UPLOAD: ${{ steps.upload-turksatkablo.outcome }}
+        run: |
+          failed=0
+
+          for result in "$TVPLUS_GRAB" "$TVPLUS_VALIDATE" "$TVPLUS_UPLOAD"; do
+            if [[ "$result" != "success" ]]; then
+              echo "::error::TV+ did not complete every grab, validation, and upload step successfully."
+              failed=1
+              break
+            fi
+          done
+
+          for result in "$TURKSAT_GRAB" "$TURKSAT_VALIDATE" "$TURKSAT_UPLOAD"; do
+            if [[ "$result" != "success" ]]; then
+              echo "::error::Türksat did not complete every grab, validation, and upload step successfully."
+              failed=1
+              break
+            fi
+          done
+
+          exit "$failed"
+
+  publish-release:
+    needs: [sync-upstream, grab-tr]
+    if: ${{ !cancelled() && needs.sync-upstream.result == 'success' && needs.grab-tr.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Prepare guide directory
+        run: mkdir -p guides
+
+      - name: Download validated guides
+        uses: actions/download-artifact@v8
+        with:
+          pattern: guides-*
+          path: guides
+          merge-multiple: true
+
+      - name: Check available guides
+        id: files
+        run: |
+          shopt -s nullglob
+          files=(guides/*.guide.xml)
+          count=${#files[@]}
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Validated guides available for release: $count"
+
+          if (( count == 0 )); then
+            echo "::error::No EPG guides passed validation; refusing to publish an empty release update."
+            exit 1
+          fi
+
+      - name: Publish validated guides
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "guides/*.guide.xml,guides/*.guide.xml.gz"
+          allowUpdates: true
+          replacesArtifacts: true
+          removeArtifacts: false
+          makeLatest: true
+          tag: 1.0.0
